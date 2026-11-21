@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -55,6 +56,13 @@ class AppState:
         self.now_ms = lambda: int(time.time() * 1000)
         self.startup_count = int(self.storage.get_meta("startup_count") or 0) + 1
         self.storage.set_meta("startup_count", str(self.startup_count))
+        if self.storage.recovered_orphan_exports:
+            print(
+                f"recovery: 已清理 {self.storage.recovered_orphan_exports} 条"
+                "属于未关闭窗口的残留导出记录（旧库中断写入遗留），"
+                "这些窗口将按当前 span 与配额重新结算",
+                flush=True,
+            )
 
     # ------------------------------------------------------------- windows
     def phase_of(self, w) -> str:
@@ -135,10 +143,15 @@ class AppState:
             return self._snapshot_locked(self.storage.get_window(window_id))
 
     def _finalize_locked(self, window_id: int) -> None:
-        """Run the tail decision once and persist exported trace ids.
+        """Run the tail decision once and persist it atomically.
 
-        The export table has a primary key on (window_id, trace_id), so even
-        a duplicate finalize pass can never export a trace twice.
+        The whole export batch and the window close commit in a single
+        transaction (see ``Storage.finalize_window``). A write failure
+        raises: nothing is exported, the window stays open and every
+        received span and quota is preserved, so while the window is still
+        collecting / in grace, late spans and quota changes keep working
+        and the finalize can simply be retried — the retry re-settles from
+        the spans and quotas in effect at that moment.
         """
         w = self.storage.get_window(window_id)
         span_rows = self.storage.get_spans(window_id)
@@ -149,11 +162,20 @@ class AppState:
             traces, quotas, w["default_quota"], w["slow_ms"], already
         )
         now = self.now_ms()
-        for trace_id, d in result["decisions"].items():
-            if d["decision"] == sampler.KEEP and trace_id not in already:
-                count = len(traces[trace_id].spans)
-                self.storage.save_export(window_id, trace_id, now, count)
-        self.storage.close_window(window_id, now)
+        batch = [
+            (trace_id, len(traces[trace_id].spans))
+            for trace_id, d in result["decisions"].items()
+            if d["decision"] == sampler.KEEP and trace_id not in already
+        ]
+        try:
+            self.storage.finalize_window(window_id, batch, now)
+        except sqlite3.Error as e:
+            raise ApiError(
+                500,
+                f"导出写入失败：{e}。窗口未关闭、未产生任何导出，"
+                "已接收的 span 与配额保持不变；收集期/宽限期内仍可继续补传 "
+                "span 和调整配额，请重试结束窗口。",
+            )
 
     # ---------------------------------------------------------------- spans
     def submit_span(self, payload: dict) -> dict:

@@ -30,7 +30,8 @@
 │   ├── demo.py              # 四个一键演示场景
 │   └── static/              # 单页前端（index.html / app.js / styles.css）
 ├── tests/
-│   ├── test_sampler.py      # 14 项端到端单测（假时钟，确定性）
+│   ├── test_sampler.py      # 15 项端到端单测（假时钟，确定性）
+│   ├── test_finalize_atomicity.py  # 5 项收尾原子性/旧库恢复回归（故障注入）
 │   └── smoke_http.py        # 对真实运行服务的 25 项 HTTP 冒烟检查
 ├── run.py                   # 入口（自带 sys.path 处理，支持 python -I）
 ├── Dockerfile               # python:3.11-slim，无需 pip install
@@ -66,6 +67,9 @@ DB_PATH=./data/tracing.db PORT=8080 python3 -I run.py
 | 任一服务槽位不足 → 整条链路 `drop_quota`，不导出任何 span | `blocking` 分支 |
 | 配额是硬上限：错误链路在配额满时一样丢弃，原因里明确说明 | 同上（高优先丢弃时附加说明文案） |
 | 宽限期内迟到 span 可改变**暂定**决策；关闭后才最终落库 | `tentative_evaluation` + `_finalize_locked` |
+| 整批导出与窗口关闭**同一事务**生效；写入失败整体回滚、窗口保持打开、已收 span 与配额不变，可重试 | `storage.finalize_window`（单事务）+ `_finalize_locked` 报错 |
+| 重试按**当时**已接收的 span 和有效配额重新结算 | `_finalize_locked` 每次重算，失败不留残留 |
+| 打开旧库时清理未关闭窗口的残留导出（旧版写一半失败遗留），不列为导出、不占配额 | `Storage.__init__` 启动恢复 |
 | 已导出链路幂等：重新结束窗口不产生重复导出，且仍占用配额 | `exports` 表主键 `(window_id, trace_id)` + 已导出槽位恢复 |
 | 重启恢复未完成窗口 | 全部状态在 SQLite；`AppState` 重建后 `advance()` 自动补关闭 |
 
@@ -89,8 +93,12 @@ DB_PATH=./data/tracing.db PORT=8080 python3 -I run.py
 ## 自测
 
 ```bash
-# 14 项确定性单测（假时钟驱动 collecting→grace→closed 全流程）
+# 15 项确定性单测（假时钟驱动 collecting→grace→closed 全流程）
 python3 -I tests/test_sampler.py
+
+# 5 项收尾原子性回归：写入失败回滚重试、宽限期内补传/调配额后重结算、
+# 旧库残留导出恢复、已关闭窗口幂等（故障注入连接模拟写盘失败）
+python3 -I tests/test_finalize_atomicity.py
 
 # HTTP 冒烟（先起服务）
 DB_PATH=/tmp/smoke.db PORT=8091 python3 -I run.py &
@@ -99,7 +107,8 @@ python3 -I tests/smoke_http.py http://127.0.0.1:8091
 
 覆盖：乱序 span、迟到错误翻转、配额硬上限、跨服务原子性、重启恢复、
 幂等导出、关闭后拒 span、重复 span 幂等、默认配额、慢请求优先、运行中
-调配额、输入校验、演示场景装载。
+调配额、输入校验、演示场景装载、导出与关窗原子提交、写入失败报错重试、
+旧库残留恢复。
 
 ## 主要 API
 

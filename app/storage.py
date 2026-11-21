@@ -4,6 +4,16 @@ All state needed to resume an unfinished window after a restart lives here:
 window definitions, per-service quotas, received spans and export records.
 The trace-level keep/drop decisions themselves are *derived* from spans and
 quotas and therefore do not need a separate table.
+
+Invariant: an export row only ever exists for a *closed* window. It is
+enforced two ways:
+
+* ``finalize_window`` commits the whole export batch and the window close
+  in a single transaction, so a write failure can never leave a
+  half-exported, still-open window behind;
+* on open, leftover export rows of unclosed windows (written by older
+  versions whose finalize died halfway) are deleted, so they are neither
+  listed as exports nor counted against any quota.
 """
 
 from __future__ import annotations
@@ -80,6 +90,16 @@ class Storage:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # Recovery for databases written by older versions: a finalize
+            # pass that died halfway could leave export rows behind for a
+            # window that is still open. Those leftovers must neither be
+            # listed as exports nor occupy quota, so drop them — the open
+            # window is re-settled from its spans and quotas when it is
+            # finalized (again).
+            self.recovered_orphan_exports = self._conn.execute(
+                "DELETE FROM exports WHERE window_id IN "
+                "(SELECT id FROM windows WHERE status != 'closed')"
+            ).rowcount
             self._conn.commit()
 
     @property
@@ -142,13 +162,39 @@ class Storage:
                 ).fetchall()
             )
 
-    def close_window(self, window_id: int, finalized_at_ms: int) -> None:
+    # -------------------------------------------------------------- finalize
+    def finalize_window(
+        self,
+        window_id: int,
+        exports: list[tuple[str, int]],
+        finalized_at_ms: int,
+    ) -> None:
+        """Persist the export batch and close the window atomically.
+
+        Every ``(trace_id, span_count)`` export row and the status flip to
+        ``closed`` commit in ONE transaction. If any write fails, the whole
+        batch is rolled back: no partial export rows survive, the window
+        stays open, and already-received spans and quotas are untouched, so
+        the finalize can simply be retried. The retry then re-settles from
+        the spans and quotas in effect at that moment.
+        """
         with self._lock:
-            self._conn.execute(
-                "UPDATE windows SET status='closed', finalized_at_ms=? WHERE id=?",
-                (finalized_at_ms, window_id),
-            )
-            self._conn.commit()
+            try:
+                for trace_id, span_count in exports:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO exports(window_id, trace_id, "
+                        "exported_at_ms, span_count) VALUES(?,?,?,?)",
+                        (window_id, trace_id, finalized_at_ms, span_count),
+                    )
+                self._conn.execute(
+                    "UPDATE windows SET status='closed', finalized_at_ms=? "
+                    "WHERE id=?",
+                    (finalized_at_ms, window_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     # ---------------------------------------------------------------- quotas
     def upsert_quota(self, window_id: int, service: str, quota: int) -> None:
@@ -208,16 +254,6 @@ class Storage:
             return int(row["c"])
 
     # --------------------------------------------------------------- exports
-    def save_export(self, window_id: int, trace_id: str, exported_at_ms: int,
-                    span_count: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO exports(window_id, trace_id, "
-                "exported_at_ms, span_count) VALUES(?,?,?,?)",
-                (window_id, trace_id, exported_at_ms, span_count),
-            )
-            self._conn.commit()
-
     def get_exported_trace_ids(self, window_id: int) -> set[str]:
         with self._lock:
             rows = self._conn.execute(
