@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>链路追踪尾部采样演练台</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <h1>链路追踪尾部采样演练台 <span class="sub">Tail-Based Sampling Workbench</span></h1>
+  <div class="health">
+    <span id="health-dot" class="dot">●</span>
+    <span id="health-text">连接中…</span>
+    <span id="startup-count" class="pill" title="进程启动次数（模拟重启后递增）"></span>
+  </div>
+</header>
+
+<main>
+  <!-- ===================== 演示场景 ===================== -->
+  <section class="card">
+    <h2>① 一键演示场景</h2>
+    <p class="hint">每个场景自动创建一个短窗口（收集 3–4 秒 + 宽限 2–3 秒），可观察完整生命周期。</p>
+    <div class="demo-buttons">
+      <button data-demo="out-of-order">乱序 span</button>
+      <button data-demo="late-error">宽限期迟到错误</button>
+      <button data-demo="quota-exhausted">配额耗尽</button>
+      <button data-demo="multi-service">跨服务配额联动</button>
+      <button id="btn-restart" class="secondary">模拟进程重启（从 SQLite 恢复）</button>
+      <button id="btn-reset" class="danger">清空全部数据</button>
+    </div>
+    <div id="demo-msg" class="demo-msg"></div>
+  </section>
+
+  <!-- ===================== 窗口控制 ===================== -->
+  <section class="card">
+    <h2>② 收集窗口与采样参数</h2>
+    <div class="grid">
+      <label>收集窗口时长 (ms)
+        <input type="number" id="collect_ms" value="10000" min="500" step="500">
+      </label>
+      <label>宽限期 (ms)
+        <input type="number" id="grace_ms" value="3000" min="0" step="500">
+      </label>
+      <label>慢请求阈值 (ms)
+        <input type="number" id="slow_ms" value="500" min="1" step="50">
+      </label>
+      <label>默认服务保留配额
+        <input type="number" id="default_quota" value="3" min="0" step="1">
+      </label>
+      <label class="span2">每服务配额（JSON，如 <code>{"gateway":2,"orders":1}</code>）
+        <input type="text" id="quotas_json" value='{"gateway":2,"payment":1}'>
+      </label>
+    </div>
+    <div class="actions">
+      <button id="btn-create-window">创建窗口</button>
+      <button id="btn-finalize" class="secondary" disabled>立即结束并导出</button>
+    </div>
+  </section>
+
+  <!-- ===================== span 提交 ===================== -->
+  <section class="card">
+    <h2>③ 提交 span（值班员手工录入）</h2>
+    <div class="grid">
+      <label>span_id<input type="text" id="span_id" placeholder="span-001"></label>
+      <label>trace_id<input type="text" id="trace_id" placeholder="trace-A"></label>
+      <label>服务名<input type="text" id="service" placeholder="gateway"></label>
+      <label>操作名<input type="text" id="operation" placeholder="GET /api/x"></label>
+      <label>开始时间戳 (ms，留空=现在)
+        <input type="number" id="start_ms" placeholder="留空取当前时间">
+      </label>
+      <label>耗时 (ms)<input type="number" id="duration_ms" value="120" min="0"></label>
+      <label>状态
+        <select id="status">
+          <option value="ok">ok</option>
+          <option value="error">error</option>
+          <option value="timeout">timeout</option>
+        </select>
+      </label>
+    </div>
+    <div class="actions">
+      <button id="btn-submit-span">提交 span</button>
+      <span class="hint">是否迟到由服务端按时间戳与到达时刻判定：时间戳落在收集窗口结束之后、宽限期结束之前的 span 会被标记为“迟到”，仍可翻转未导出的决策。</span>
+    </div>
+  </section>
+
+  <!-- ===================== 当前窗口状态 ===================== -->
+  <section class="card">
+    <h2>④ 当前窗口状态</h2>
+    <div id="window-panel"><p class="hint">尚未创建窗口。</p></div>
+  </section>
+
+  <!-- ===================== 配额占用 ===================== -->
+  <section class="card">
+    <h2>⑤ 服务配额占用</h2>
+    <div id="quota-panel"><p class="hint">窗口创建后展示。</p></div>
+  </section>
+
+  <!-- ===================== 链路决策 ===================== -->
+  <section class="card">
+    <h2>⑥ 链路级保留 / 丢弃 / 等待决策</h2>
+    <div id="trace-panel"><p class="hint">窗口创建后展示。</p></div>
+  </section>
+
+  <!-- ===================== 导出记录 ===================== -->
+  <section class="card">
+    <h2>⑦ 导出记录（已导出链路不重复导出）</h2>
+    <div id="export-panel"><p class="hint">窗口关闭后展示。</p></div>
+  </section>
+
+  <!-- ===================== 历史窗口 ===================== -->
+  <section class="card">
+    <h2>⑧ 历史窗口</h2>
+    <div id="history-panel"><p class="hint">加载中…</p></div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
